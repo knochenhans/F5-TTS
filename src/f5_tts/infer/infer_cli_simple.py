@@ -3,7 +3,6 @@ import codecs
 import glob
 import os
 import re
-from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
 
@@ -11,7 +10,6 @@ import numpy as np
 import soundfile as sf
 import tomli
 from cached_path import cached_path
-from omegaconf import OmegaConf
 
 from f5_tts.infer.utils_infer import (
     mel_spec_type,
@@ -36,7 +34,7 @@ temp_files = []
 
 parser = argparse.ArgumentParser(
     prog="python3 infer-cli.py",
-    description="Commandline interface for E2/F5 TTS with Advanced Batch Processing.",
+    description="Commandline interface for F5 TTS with Advanced Batch Processing.",
     epilog="Specify options above to override one or more settings from config.",
 )
 parser.add_argument(
@@ -47,15 +45,8 @@ parser.add_argument(
         files("f5_tts").joinpath("infer/examples/basic"), "basic.toml"
     ),
 )
-parser.add_argument(
-    "--save_chunk",
-    action="store_true",
-    help="To save each audio chunks during inference",
-    default=False,
-)
-args = parser.parse_args()
 
-save_chunk = args.save_chunk
+args = parser.parse_args()
 
 
 def process_config(config_path, ema_model, vocoder):
@@ -64,36 +55,12 @@ def process_config(config_path, ema_model, vocoder):
     ref_audio = config["ref_audio"]
     ref_text = config["ref_text"]
     gen_text = config["gen_text"]
-    # gen_file = config["gen_file"]
-    gen_file = ""
-
-    # patches for pip pkg user
-    if "infer/examples/" in ref_audio:
-        ref_audio = str(files("f5_tts").joinpath(f"{ref_audio}"))
-    if "infer/examples/" in gen_file:
-        gen_file = str(files("f5_tts").joinpath(f"{gen_file}"))
-    if "voices" in config:
-        for voice in config["voices"]:
-            voice_ref_audio = config["voices"][voice]["ref_audio"]
-            if "infer/examples/" in voice_ref_audio:
-                config["voices"][voice]["ref_audio"] = str(
-                    files("f5_tts").joinpath(f"{voice_ref_audio}")
-                )
-
-    if gen_file:
-        gen_text = codecs.open(gen_file, "r", "utf-8").read()
     output_dir = config["output_dir"]
-    # output_file = config["output_file"]
     output_file = f"{Path(config_path).stem}.wav"
     remove_silence = False
     speed = config["speed"]
 
     wave_path = Path(output_dir) / output_file
-
-    if save_chunk:
-        output_chunk_dir = os.path.join(output_dir, f"{Path(output_file).stem}_chunks")
-        if not os.path.exists(output_chunk_dir):
-            os.makedirs(output_chunk_dir)
 
     main_process(
         ref_audio,
@@ -120,19 +87,10 @@ def main_process(
     output_dir,
     wave_path,
 ):
-    main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
-    # if "voices" not in config:
-    voices = {"main": main_voice}
-    # else:
-    #     voices = config["voices"]
-    #     voices["main"] = main_voice
-    for voice in voices:
-        print("Voice:", voice)
-        print("ref_audio ", voices[voice]["ref_audio"])
-        voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
-            voices[voice]["ref_audio"], voices[voice]["ref_text"]
-        )
-        print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
+     # preprocess ref_audio and ref_text
+    ref_audio, ref_text = preprocess_ref_audio_text(
+        ref_audio, ref_text
+    )
 
     generated_audio_segments = []
     reg1 = r"(?=\[\w+\])"
@@ -140,23 +98,14 @@ def main_process(
     reg2 = r"\[(\w+)\]"
     for i, text in enumerate(chunks):
         print(f"Processing chunk {i+1}/{len(chunks)}")
+
         if not text.strip():
             continue
-        match = re.match(reg2, text)
-        if match:
-            voice = match[1]
-        else:
-            print("No voice tag found, using main.")
-            voice = "main"
-        if voice not in voices:
-            print(f"Voice {voice} not found, using main.")
-            voice = "main"
+
         text = re.sub(reg2, "", text)
         gen_text_ = text.strip()
-        ref_audio = voices[voice]["ref_audio"]
-        ref_text = voices[voice]["ref_text"]
-        print(f"Voice: {voice}")
-        audio_segment, final_sample_rate, spectragram = infer_process(
+        
+        audio_segment, final_sample_rate, _ = infer_process(
             ref_audio,
             ref_text,
             gen_text_,
@@ -188,8 +137,7 @@ def main_process(
             # Add output file to temp_files list
             temp_files.append(f.name)
 
-    for voice in voices:
-        os.remove(voices[voice]["ref_audio"])
+    os.remove(ref_audio)
 
 
 def cleanup_temp_files():
@@ -206,11 +154,8 @@ def main():
     
     vocoder_name = "vocos"
     mel_spec_type = "vocos"
-    if vocoder_name == "vocos":
-        vocoder_local_path = "../checkpoints/vocos-mel-24khz"
-    elif vocoder_name == "bigvgan":
-        vocoder_local_path = "../checkpoints/bigvgan_v2_24khz_100band_256x"
-
+    vocoder_local_path = "../checkpoints/vocos-mel-24khz"
+  
     vocoder = load_vocoder(
         vocoder_name=mel_spec_type,
         is_local=False,
@@ -237,31 +182,7 @@ def main():
                         f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors"
                     )
                 )
-            elif vocoder_name == "bigvgan":
-                repo_name = "F5-TTS"
-                exp_name = "F5TTS_Base_bigvgan"
-                ckpt_step = 1250000
-                ckpt_file = str(
-                    cached_path(
-                        f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.pt"
-                    )
-                )
 
-    elif model == "E2-TTS":
-        assert vocoder_name == "vocos", "E2-TTS only supports vocoder vocos"
-        model_cls = UNetT
-        model_cfg = dict(dim=1024, depth=24, heads=16, ff_mult=4)
-        if ckpt_file == "":
-            repo_name = "E2-TTS"
-            exp_name = "E2TTS_Base"
-            ckpt_step = 1200000
-            ckpt_file = str(
-                cached_path(
-                    f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors"
-                )
-            )
-
-    print(f"Using {model}...")
     ema_model = load_model(
         model_cls,
         model_cfg,
